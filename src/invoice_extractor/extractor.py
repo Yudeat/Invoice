@@ -138,6 +138,25 @@ def _get_client() -> Client:
     return genai.Client(api_key=api_key)
 
 
+_TRANSPORT_MODULES = frozenset(
+    {"httpx", "httpx2", "httpcore", "requests", "urllib3", "ssl", "socket"}
+)
+
+
+def _is_transport_error(exc: BaseException) -> bool:
+    """True for network/transport failures, whichever HTTP library the SDK uses.
+
+    Programming errors (TypeError, AssertionError, ...) are deliberately not
+    matched, so they surface instead of being retried or hidden.
+    """
+    if isinstance(exc, OSError):  # ConnectionError, TimeoutError, requests errors
+        return True
+    return any(
+        cls.__module__.split(".")[0] in _TRANSPORT_MODULES
+        for cls in type(exc).__mro__
+    )
+
+
 def _retry_delay(attempt: int) -> float:
     """Capped exponential backoff: 2, 4, 8, 16, then 30 seconds."""
     return float(min(2 ** min(attempt, 5), _MAX_RETRY_DELAY_SECONDS))
@@ -226,7 +245,9 @@ def extract_invoice(
                     # through to the next configured model.
                     break
 
-                except Exception as exc:  # transport errors differ across SDK versions
+                except Exception as exc:
+                    if not _is_transport_error(exc):
+                        raise  # programming errors must not be retried or hidden
                     last_error = (
                         f"{model}: network request failed ({type(exc).__name__})."
                     )

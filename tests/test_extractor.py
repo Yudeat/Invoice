@@ -8,7 +8,6 @@ from types import SimpleNamespace
 
 import pytest
 from google.genai import errors as genai_errors
-from httpx import ConnectError
 
 from invoice_extractor import extractor
 from invoice_extractor.errors import (
@@ -62,16 +61,10 @@ class FakeClient:
         self.closed = True
 
 
-def api_error(code):
+def api_error(code, message="Scripted API failure"):
     return genai_errors.APIError(
         code,
-        {
-            "error": {
-                "code": code,
-                "message": "Scripted API failure",
-                "status": "UNKNOWN",
-            }
-        },
+        {"error": {"code": code, "message": message, "status": "UNKNOWN"}},
     )
 
 
@@ -83,10 +76,7 @@ def test_happy_path(sample_image):
     client = FakeClient([GOOD])
 
     raw, model = extract_invoice(
-        sample_image,
-        client=client,
-        models=["m1"],
-        sleep=no_sleep,
+        sample_image, client=client, models=["m1"], sleep=no_sleep
     )
 
     assert raw.invoice_number == "RT-2024-1052"
@@ -100,10 +90,7 @@ def test_retries_on_rate_limit_then_succeeds(sample_image):
     delays = []
 
     raw, model = extract_invoice(
-        sample_image,
-        client=client,
-        models=["m1"],
-        sleep=delays.append,
+        sample_image, client=client, models=["m1"], sleep=delays.append
     )
 
     assert raw.total_amount == 113565
@@ -117,10 +104,7 @@ def test_falls_back_to_next_model_on_404(sample_image):
     delays = []
 
     _, model = extract_invoice(
-        sample_image,
-        client=client,
-        models=["old", "new"],
-        sleep=delays.append,
+        sample_image, client=client, models=["old", "new"], sleep=delays.append
     )
 
     assert model == "new"
@@ -135,15 +119,24 @@ def test_auth_failure_raises_config_error(sample_image, status_code):
 
     with pytest.raises(ConfigError):
         extract_invoice(
-            sample_image,
-            client=client,
-            models=["m1", "m2"],
-            sleep=delays.append,
+            sample_image, client=client, models=["m1", "m2"], sleep=delays.append
         )
 
     assert client.models.calls == ["m1"]
     assert delays == []
     assert client.closed is False
+
+
+def test_invalid_key_400_raises_config_error(sample_image):
+    # Google reports an invalid key as HTTP 400, not 401.
+    client = FakeClient([api_error(400, "API key not valid. Please pass a valid API key.")])
+
+    with pytest.raises(ConfigError):
+        extract_invoice(
+            sample_image, client=client, models=["m1", "m2"], sleep=no_sleep
+        )
+
+    assert client.models.calls == ["m1"]
 
 
 def test_all_models_fail_raises_extraction_error(sample_image):
@@ -152,10 +145,7 @@ def test_all_models_fail_raises_extraction_error(sample_image):
 
     with pytest.raises(ExtractionError, match="AI extraction failed"):
         extract_invoice(
-            sample_image,
-            client=client,
-            models=["a", "b"],
-            sleep=delays.append,
+            sample_image, client=client, models=["a", "b"], sleep=delays.append
         )
 
     assert client.models.calls == ["a", "a", "a", "b", "b", "b"]
@@ -164,19 +154,28 @@ def test_all_models_fail_raises_extraction_error(sample_image):
 
 
 def test_transport_failure_is_retried(sample_image):
-    client = FakeClient([ConnectError("Connection failed"), GOOD])
+    # ConnectionError is an OSError, the built-in base of most transport failures.
+    client = FakeClient([ConnectionError("Connection failed"), GOOD])
     delays = []
 
     _, model = extract_invoice(
-        sample_image,
-        client=client,
-        models=["m1"],
-        sleep=delays.append,
+        sample_image, client=client, models=["m1"], sleep=delays.append
     )
 
     assert model == "m1"
     assert client.models.calls == ["m1", "m1"]
     assert delays == [2.0]
+
+
+def test_transport_failure_exhausts_retries(sample_image):
+    client = FakeClient([ConnectionError("boom")] * 3)
+
+    with pytest.raises(ExtractionError, match="network request failed"):
+        extract_invoice(
+            sample_image, client=client, models=["m1"], sleep=no_sleep
+        )
+
+    assert client.models.calls == ["m1", "m1", "m1"]
 
 
 def test_programming_error_is_not_retried(sample_image):
@@ -185,10 +184,7 @@ def test_programming_error_is_not_retried(sample_image):
 
     with pytest.raises(TypeError, match="Unexpected programming error"):
         extract_invoice(
-            sample_image,
-            client=client,
-            models=["m1"],
-            sleep=delays.append,
+            sample_image, client=client, models=["m1"], sleep=delays.append
         )
 
     assert client.models.calls == ["m1"]
@@ -201,10 +197,7 @@ def test_empty_response_falls_back_to_next_model(sample_image, response):
     delays = []
 
     _, model = extract_invoice(
-        sample_image,
-        client=client,
-        models=["a", "b"],
-        sleep=delays.append,
+        sample_image, client=client, models=["a", "b"], sleep=delays.append
     )
 
     assert model == "b"
@@ -217,16 +210,13 @@ def test_invalid_json_is_retried_then_succeeds(sample_image):
     delays = []
 
     raw, model = extract_invoice(
-        sample_image,
-        client=client,
-        models=["m1"],
-        sleep=delays.append,
+        sample_image, client=client, models=["m1"], sleep=delays.append
     )
 
     assert raw.invoice_number == "RT-2024-1052"
     assert model == "m1"
     assert client.models.calls == ["m1", "m1"]
-    assert delays == [2.0]
+    assert delays == []  # a malformed response is retried immediately, no backoff
 
 
 def test_empty_and_garbage_responses_fail(sample_image):
@@ -234,10 +224,7 @@ def test_empty_and_garbage_responses_fail(sample_image):
 
     with pytest.raises(ExtractionError, match="schema"):
         extract_invoice(
-            sample_image,
-            client=client,
-            models=["a", "b"],
-            sleep=no_sleep,
+            sample_image, client=client, models=["a", "b"], sleep=no_sleep
         )
 
     assert client.models.calls == ["a", "b", "b", "b"]
@@ -248,10 +235,7 @@ def test_partial_ai_output_is_accepted(sample_image):
     client = FakeClient([partial])
 
     raw, model = extract_invoice(
-        sample_image,
-        client=client,
-        models=["m"],
-        sleep=no_sleep,
+        sample_image, client=client, models=["m"], sleep=no_sleep
     )
 
     assert raw.invoice_number == "X-1"
@@ -282,39 +266,24 @@ def test_invalid_model_list_is_rejected(sample_image, models):
 
     with pytest.raises(ConfigError, match="model name"):
         extract_invoice(
-            sample_image,
-            client=client,
-            models=models,
-            sleep=no_sleep,
+            sample_image, client=client, models=models, sleep=no_sleep
         )
 
     assert client.models.calls == []
 
 
 @pytest.mark.parametrize("fails", [False, True])
-def test_internally_created_client_is_closed(
-    sample_image,
-    monkeypatch,
-    fails,
-):
+def test_internally_created_client_is_closed(sample_image, monkeypatch, fails):
     client = FakeClient([api_error(503)] if fails else [GOOD])
     monkeypatch.setattr(extractor, "_get_client", lambda: client)
 
     if fails:
         with pytest.raises(ExtractionError):
             extract_invoice(
-                sample_image,
-                models=["m1"],
-                retries=1,
-                sleep=no_sleep,
+                sample_image, models=["m1"], retries=1, sleep=no_sleep
             )
     else:
-        extract_invoice(
-            sample_image,
-            models=["m1"],
-            retries=1,
-            sleep=no_sleep,
-        )
+        extract_invoice(sample_image, models=["m1"], retries=1, sleep=no_sleep)
 
     assert client.closed is True
 
